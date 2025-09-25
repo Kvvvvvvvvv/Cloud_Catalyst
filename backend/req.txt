@@ -1,0 +1,9 @@
+fastapi
+uvicorn[standard]
+pandas
+numpy
+prophet
+scipy
+yfinance
+python-multipart
+pydantic
