@@ -7,3 +7,6 @@ scipy
 yfinance
 python-multipart
 pydantic
+scikit-learn
+matplotlib
+seaborn

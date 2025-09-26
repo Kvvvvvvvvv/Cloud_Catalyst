@@ -5,6 +5,12 @@ import numpy as np
 from prophet import Prophet
 from scipy.optimize import minimize
 import logging
+from sklearn.metrics import mean_absolute_error, mean_squared_error, r2_score
+import matplotlib.pyplot as plt
+import seaborn as sns
+from typing import Dict, List, Tuple, Any
+import warnings
+warnings.filterwarnings('ignore')
 
 # --------------------------- Stock Data --------------------------- #
 def get_stock_data(symbol, period="1y"):
@@ -238,3 +244,355 @@ def extract_close_prices(raw_market_data, symbols):
     if close.shape[0] < 2:
         raise ValueError("Not enough historical rows after cleaning to compute returns.")
     return close
+
+# ======================= PREDICTION METRICS ======================= #
+
+def calculate_prediction_metrics(symbol: str, prediction_days: int = 30, test_split: float = 0.2) -> Dict[str, Any]:
+    """
+    Calculate comprehensive prediction metrics for a stock symbol.
+    
+    Returns:
+    - MAE (Mean Absolute Error)
+    - RMSE (Root Mean Squared Error) 
+    - MAPE (Mean Absolute Percentage Error)
+    - R² (Coefficient of Determination)
+    - Sharpe Ratio (Financial Metric)
+    - Prediction accuracy visualization data
+    """
+    try:
+        # Get historical data
+        data = get_stock_data(symbol, period="2y")
+        if len(data) < 100:
+            raise ValueError(f"Insufficient data for {symbol}. Need at least 100 days.")
+        
+        # Split data for backtesting
+        split_idx = int(len(data) * (1 - test_split))
+        train_data = data.iloc[:split_idx].copy()
+        test_data = data.iloc[split_idx:].copy()
+        
+        # Train model on training data
+        model = Prophet(
+            daily_seasonality=True,
+            weekly_seasonality=True,
+            yearly_seasonality=False,
+            changepoint_prior_scale=0.5
+        )
+        logging.getLogger('prophet').setLevel(logging.WARNING)
+        model.fit(train_data)
+        
+        # Predict on test period
+        future = model.make_future_dataframe(periods=len(test_data))
+        forecast = model.predict(future)
+        
+        # Get predictions for test period
+        test_predictions = forecast.tail(len(test_data))[['ds', 'yhat', 'yhat_lower', 'yhat_upper']]
+        
+        # Align predictions with actual values
+        test_data = test_data.reset_index(drop=True)
+        test_predictions = test_predictions.reset_index(drop=True)
+        
+        actual_prices = test_data['y'].values
+        predicted_prices = test_predictions['yhat'].values
+        
+        # Calculate core metrics
+        mae = mean_absolute_error(actual_prices, predicted_prices)
+        rmse = np.sqrt(mean_squared_error(actual_prices, predicted_prices))
+        mape = np.mean(np.abs((actual_prices - predicted_prices) / actual_prices)) * 100
+        r2 = r2_score(actual_prices, predicted_prices)
+        
+        # Calculate Sharpe Ratio from trading strategy
+        sharpe_ratio = calculate_trading_sharpe_ratio(actual_prices, predicted_prices)
+        
+        # Generate future predictions
+        future_forecast = predict_stock_price(symbol, days=prediction_days)
+        
+        # Create visualization data
+        viz_data = create_prediction_visualization_data(
+            train_data, test_data, test_predictions, future_forecast, symbol
+        )
+        
+        # Additional metrics
+        directional_accuracy = calculate_directional_accuracy(actual_prices, predicted_prices)
+        volatility_metrics = calculate_volatility_metrics(actual_prices, predicted_prices)
+        
+        return {
+            'symbol': symbol,
+            'metrics': {
+                'mae': round(mae, 4),
+                'rmse': round(rmse, 4),
+                'mape': round(mape, 4),
+                'r_squared': round(r2, 4),
+                'sharpe_ratio': round(sharpe_ratio, 4),
+                'directional_accuracy': round(directional_accuracy, 4),
+                'volatility_explained': round(volatility_metrics['volatility_explained'], 4),
+                'prediction_confidence': round(volatility_metrics['prediction_confidence'], 4)
+            },
+            'visualization_data': viz_data,
+            'interpretation': generate_metrics_interpretation(mae, rmse, mape, r2, sharpe_ratio),
+            'test_period_days': len(test_data),
+            'training_period_days': len(train_data)
+        }
+        
+    except Exception as e:
+        raise ValueError(f"Error calculating prediction metrics for {symbol}: {str(e)}")
+
+def calculate_trading_sharpe_ratio(actual_prices: np.ndarray, predicted_prices: np.ndarray, risk_free_rate: float = 0.02) -> float:
+    """
+    Calculate Sharpe ratio from a simple trading strategy based on predictions.
+    Strategy: Buy when prediction > current price, sell when prediction < current price
+    """
+    try:
+        # Calculate actual returns
+        actual_returns = np.diff(actual_prices) / actual_prices[:-1]
+        
+        # Calculate prediction signals (1 for buy, -1 for sell)
+        price_changes = np.diff(actual_prices)
+        prediction_changes = np.diff(predicted_prices)
+        
+        # Simple strategy: follow prediction direction
+        signals = np.sign(prediction_changes)
+        
+        # Calculate strategy returns
+        strategy_returns = signals * actual_returns[1:]  # Align with signals
+        
+        if len(strategy_returns) == 0 or np.std(strategy_returns) == 0:
+            return 0.0
+        
+        # Calculate Sharpe ratio (annualized)
+        mean_return = np.mean(strategy_returns) * 252  # Annualize
+        volatility = np.std(strategy_returns) * np.sqrt(252)  # Annualize
+        
+        sharpe = (mean_return - risk_free_rate) / volatility if volatility > 0 else 0.0
+        return sharpe
+        
+    except Exception:
+        return 0.0
+
+def calculate_directional_accuracy(actual_prices: np.ndarray, predicted_prices: np.ndarray) -> float:
+    """
+    Calculate what percentage of the time the model correctly predicts price direction.
+    """
+    try:
+        actual_directions = np.sign(np.diff(actual_prices))
+        predicted_directions = np.sign(np.diff(predicted_prices))
+        
+        correct_predictions = np.sum(actual_directions == predicted_directions)
+        total_predictions = len(actual_directions)
+        
+        return (correct_predictions / total_predictions) * 100 if total_predictions > 0 else 0.0
+        
+    except Exception:
+        return 0.0
+
+def calculate_volatility_metrics(actual_prices: np.ndarray, predicted_prices: np.ndarray) -> Dict[str, float]:
+    """
+    Calculate how well the model explains volatility patterns.
+    """
+    try:
+        actual_volatility = np.std(np.diff(actual_prices) / actual_prices[:-1])
+        predicted_volatility = np.std(np.diff(predicted_prices) / predicted_prices[:-1])
+        
+        volatility_explained = 1 - abs(actual_volatility - predicted_volatility) / actual_volatility
+        volatility_explained = max(0, min(1, volatility_explained))  # Clamp to [0,1]
+        
+        # Prediction confidence based on consistency
+        residuals = actual_prices - predicted_prices
+        prediction_confidence = 1 - (np.std(residuals) / np.mean(actual_prices))
+        prediction_confidence = max(0, min(1, prediction_confidence))  # Clamp to [0,1]
+        
+        return {
+            'volatility_explained': volatility_explained,
+            'prediction_confidence': prediction_confidence
+        }
+        
+    except Exception:
+        return {'volatility_explained': 0.0, 'prediction_confidence': 0.0}
+
+def create_prediction_visualization_data(train_data: pd.DataFrame, test_data: pd.DataFrame, 
+                                       test_predictions: pd.DataFrame, future_forecast: pd.DataFrame,
+                                       symbol: str) -> Dict[str, Any]:
+    """
+    Create data structure for prediction accuracy visualization.
+    """
+    try:
+        # Historical data
+        historical_data = {
+            'dates': train_data['ds'].dt.strftime('%Y-%m-%d').tolist(),
+            'prices': train_data['y'].tolist(),
+            'type': 'historical'
+        }
+        
+        # Test period actual vs predicted
+        test_actual = {
+            'dates': test_data['ds'].dt.strftime('%Y-%m-%d').tolist(),
+            'prices': test_data['y'].tolist(),
+            'type': 'actual_test'
+        }
+        
+        test_predicted = {
+            'dates': test_predictions['ds'].dt.strftime('%Y-%m-%d').tolist(),
+            'prices': test_predictions['yhat'].tolist(),
+            'upper_bound': test_predictions['yhat_upper'].tolist(),
+            'lower_bound': test_predictions['yhat_lower'].tolist(),
+            'type': 'predicted_test'
+        }
+        
+        # Future predictions
+        future_predictions = {
+            'dates': future_forecast['ds'].dt.strftime('%Y-%m-%d').tolist(),
+            'prices': future_forecast['yhat'].tolist(),
+            'upper_bound': future_forecast['yhat_upper'].tolist(),
+            'lower_bound': future_forecast['yhat_lower'].tolist(),
+            'type': 'future_forecast'
+        }
+        
+        return {
+            'symbol': symbol,
+            'historical': historical_data,
+            'test_actual': test_actual,
+            'test_predicted': test_predicted,
+            'future_forecast': future_predictions,
+            'chart_title': f'{symbol} Prediction Accuracy Analysis',
+            'subtitle': 'Historical | Test Period (Actual vs Predicted) | Future Forecast'
+        }
+        
+    except Exception as e:
+        return {'error': str(e)}
+
+def generate_metrics_interpretation(mae: float, rmse: float, mape: float, r2: float, sharpe_ratio: float) -> Dict[str, str]:
+    """
+    Generate human-readable interpretations of the metrics.
+    """
+    interpretations = {}
+    
+    # MAE interpretation
+    if mae < 5:
+        interpretations['mae'] = "Excellent prediction accuracy - very low average error"
+    elif mae < 15:
+        interpretations['mae'] = "Good prediction accuracy - reasonable average error"
+    elif mae < 30:
+        interpretations['mae'] = "Moderate prediction accuracy - noticeable average error"
+    else:
+        interpretations['mae'] = "Poor prediction accuracy - high average error"
+    
+    # RMSE interpretation
+    rmse_mae_ratio = rmse / mae if mae > 0 else 1
+    if rmse_mae_ratio < 1.5:
+        interpretations['rmse'] = "Consistent prediction errors - few outliers"
+    elif rmse_mae_ratio < 2.0:
+        interpretations['rmse'] = "Some large prediction errors present"
+    else:
+        interpretations['rmse'] = "Significant outliers - model struggles with extreme movements"
+    
+    # MAPE interpretation
+    if mape < 5:
+        interpretations['mape'] = "Excellent percentage accuracy - highly reliable"
+    elif mape < 10:
+        interpretations['mape'] = "Good percentage accuracy - suitable for trading"
+    elif mape < 20:
+        interpretations['mape'] = "Moderate percentage accuracy - use with caution"
+    else:
+        interpretations['mape'] = "Poor percentage accuracy - not suitable for trading"
+    
+    # R² interpretation
+    if r2 > 0.8:
+        interpretations['r2'] = "Excellent model fit - explains most price variance"
+    elif r2 > 0.6:
+        interpretations['r2'] = "Good model fit - explains majority of price variance"
+    elif r2 > 0.4:
+        interpretations['r2'] = "Moderate model fit - explains some price variance"
+    elif r2 > 0:
+        interpretations['r2'] = "Poor model fit - limited explanatory power"
+    else:
+        interpretations['r2'] = "Very poor model fit - worse than simple average"
+    
+    # Sharpe Ratio interpretation
+    if sharpe_ratio > 2:
+        interpretations['sharpe'] = "Excellent risk-adjusted returns - highly profitable strategy"
+    elif sharpe_ratio > 1:
+        interpretations['sharpe'] = "Good risk-adjusted returns - profitable strategy"
+    elif sharpe_ratio > 0:
+        interpretations['sharpe'] = "Moderate risk-adjusted returns - marginally profitable"
+    else:
+        interpretations['sharpe'] = "Poor risk-adjusted returns - losing strategy"
+    
+    return interpretations
+
+def calculate_portfolio_prediction_metrics(symbols: List[str], weights: List[float], 
+                                         prediction_days: int = 30) -> Dict[str, Any]:
+    """
+    Calculate prediction metrics for an entire portfolio.
+    """
+    try:
+        individual_metrics = []
+        portfolio_performance = {'total_mae': 0, 'total_rmse': 0, 'total_mape': 0, 
+                               'total_r2': 0, 'total_sharpe': 0, 'valid_symbols': 0}
+        
+        for i, symbol in enumerate(symbols):
+            try:
+                metrics = calculate_prediction_metrics(symbol, prediction_days)
+                individual_metrics.append(metrics)
+                
+                # Weight the metrics by portfolio allocation
+                weight = weights[i]
+                portfolio_performance['total_mae'] += metrics['metrics']['mae'] * weight
+                portfolio_performance['total_rmse'] += metrics['metrics']['rmse'] * weight
+                portfolio_performance['total_mape'] += metrics['metrics']['mape'] * weight
+                portfolio_performance['total_r2'] += metrics['metrics']['r_squared'] * weight
+                portfolio_performance['total_sharpe'] += metrics['metrics']['sharpe_ratio'] * weight
+                portfolio_performance['valid_symbols'] += 1
+                
+            except Exception as e:
+                print(f"Warning: Could not calculate metrics for {symbol}: {e}")
+                continue
+        
+        # Calculate portfolio-wide interpretation
+        portfolio_interpretation = generate_metrics_interpretation(
+            portfolio_performance['total_mae'],
+            portfolio_performance['total_rmse'],
+            portfolio_performance['total_mape'],
+            portfolio_performance['total_r2'],
+            portfolio_performance['total_sharpe']
+        )
+        
+        return {
+            'portfolio_metrics': {
+                'weighted_mae': round(portfolio_performance['total_mae'], 4),
+                'weighted_rmse': round(portfolio_performance['total_rmse'], 4),
+                'weighted_mape': round(portfolio_performance['total_mape'], 4),
+                'weighted_r2': round(portfolio_performance['total_r2'], 4),
+                'weighted_sharpe': round(portfolio_performance['total_sharpe'], 4),
+                'symbols_analyzed': portfolio_performance['valid_symbols'],
+                'total_symbols': len(symbols)
+            },
+            'individual_metrics': individual_metrics,
+            'portfolio_interpretation': portfolio_interpretation,
+            'recommendation': generate_portfolio_recommendation(portfolio_performance)
+        }
+        
+    except Exception as e:
+        raise ValueError(f"Error calculating portfolio prediction metrics: {str(e)}")
+
+def generate_portfolio_recommendation(portfolio_performance: Dict[str, float]) -> str:
+    """
+    Generate trading recommendation based on portfolio prediction metrics.
+    """
+    mae = portfolio_performance['total_mae']
+    r2 = portfolio_performance['total_r2']
+    sharpe = portfolio_performance['total_sharpe']
+    mape = portfolio_performance['total_mape']
+    
+    score = 0
+    if mae < 10: score += 1
+    if r2 > 0.6: score += 1
+    if sharpe > 1: score += 1
+    if mape < 10: score += 1
+    
+    if score >= 3:
+        return "STRONG BUY - Excellent prediction metrics across all measures"
+    elif score >= 2:
+        return "BUY - Good prediction metrics, suitable for trading"
+    elif score >= 1:
+        return "HOLD - Moderate prediction quality, proceed with caution"
+    else:
+        return "AVOID - Poor prediction metrics, not recommended for trading"

@@ -1,6 +1,7 @@
 import React, { useState } from "react";
 import ConfigPanel from "./components/ConfigPanel";
 import PortfolioSummary from "./components/PortfolioSummary";
+import PredictionMetrics from "./components/PredictionMetrics";
 import Charts from "./components/Charts";
 import AllocationTable from "./components/AllocationTable";
 import MarketOverview from "./components/MarketOverview";
@@ -120,6 +121,7 @@ export default function App() {
           {result ? (
             <>
               <PortfolioSummary summary={result} />
+              <PredictionMetrics predictionMetrics={result.prediction_metrics} />
               <Charts
                 portfolioValues={result.portfolio_values}
                 predictions={result.predictions}

@@ -1,4 +1,5 @@
 from fastapi import FastAPI, HTTPException
+from fastapi import FastAPI, HTTPException
 from fastapi.middleware.cors import CORSMiddleware
 from pydantic import BaseModel, Field
 from typing import List, Optional, Any, Dict
@@ -10,6 +11,8 @@ from utils import (
     run_cloud_simulation,
     calculate_risk_metrics,
     get_stock_data,
+    calculate_prediction_metrics,
+    calculate_portfolio_prediction_metrics,
 )
 
 
@@ -63,6 +66,35 @@ class RunSimulationResponse(BaseModel):
     data_source: Optional[str] = None
     market_overview: Optional[List[Dict[str, Any]]] = None
     optimization_objectives: Optional[Dict[str, Any]] = None
+    prediction_metrics: Optional[Dict[str, Any]] = None  # New field for metrics
+
+
+class PredictionMetricsRequest(BaseModel):
+    symbol: str
+    prediction_days: int = Field(30, ge=1, le=90)
+    test_split: float = Field(0.2, ge=0.1, le=0.5)
+
+
+class PortfolioPredictionMetricsRequest(BaseModel):
+    symbols: List[str]
+    weights: List[float]
+    prediction_days: int = Field(30, ge=1, le=90)
+
+
+class PredictionMetricsResponse(BaseModel):
+    symbol: str
+    metrics: Dict[str, float]
+    visualization_data: Dict[str, Any]
+    interpretation: Dict[str, str]
+    test_period_days: int
+    training_period_days: int
+
+
+class PortfolioPredictionMetricsResponse(BaseModel):
+    portfolio_metrics: Dict[str, Any]
+    individual_metrics: List[Dict[str, Any]]
+    portfolio_interpretation: Dict[str, str]
+    recommendation: str
 
 
 def _model_to_dict(model: BaseModel) -> Dict[str, Any]:
@@ -238,6 +270,16 @@ def api_run_simulation(payload: RunSimulationRequest):
     market_overview = _generate_market_overview()
     optimization_objectives = _model_to_dict(objectives_model)
 
+    # Calculate prediction metrics for the portfolio
+    prediction_metrics_payload = None
+    try:
+        prediction_metrics_payload = calculate_portfolio_prediction_metrics(
+            symbols, weights, prediction_days=30
+        )
+    except Exception as e:
+        print(f"Warning: Could not calculate prediction metrics: {e}")
+        prediction_metrics_payload = None
+
     return RunSimulationResponse(
         expected_return=float(simulation.get("expected_return", 0.0)),
         volatility=float(simulation.get("volatility", 0.0)),
@@ -255,4 +297,168 @@ def api_run_simulation(payload: RunSimulationRequest):
         data_source=payload.data_source,
         market_overview=market_overview,
         optimization_objectives=optimization_objectives,
+        prediction_metrics=prediction_metrics_payload,
     )
+
+
+# ======================= NEW PREDICTION METRICS ENDPOINTS ======================= #
+
+@app.post("/prediction-metrics", response_model=PredictionMetricsResponse)
+def api_prediction_metrics(payload: PredictionMetricsRequest):
+    """
+    Calculate comprehensive prediction metrics for a single stock.
+    
+    Returns:
+    - MAE (Mean Absolute Error)
+    - RMSE (Root Mean Squared Error)
+    - MAPE (Mean Absolute Percentage Error)
+    - R² (Coefficient of Determination)
+    - Sharpe Ratio (Financial Metric)
+    - Directional Accuracy
+    - Visualization data for charts
+    """
+    try:
+        symbol = payload.symbol.upper().strip()
+        metrics_result = calculate_prediction_metrics(
+            symbol=symbol,
+            prediction_days=payload.prediction_days,
+            test_split=payload.test_split
+        )
+        
+        return PredictionMetricsResponse(
+            symbol=metrics_result['symbol'],
+            metrics=metrics_result['metrics'],
+            visualization_data=metrics_result['visualization_data'],
+            interpretation=metrics_result['interpretation'],
+            test_period_days=metrics_result['test_period_days'],
+            training_period_days=metrics_result['training_period_days']
+        )
+        
+    except Exception as e:
+        raise HTTPException(status_code=400, detail=str(e))
+
+
+@app.post("/portfolio-prediction-metrics", response_model=PortfolioPredictionMetricsResponse)
+def api_portfolio_prediction_metrics(payload: PortfolioPredictionMetricsRequest):
+    """
+    Calculate comprehensive prediction metrics for an entire portfolio.
+    
+    Returns weighted portfolio metrics plus individual stock metrics.
+    """
+    try:
+        symbols = [s.strip().upper() for s in payload.symbols if s.strip()]
+        weights = payload.weights
+        
+        if len(symbols) != len(weights):
+            raise HTTPException(status_code=400, detail="Number of symbols must match number of weights")
+        
+        if abs(sum(weights) - 1.0) > 0.01:
+            raise HTTPException(status_code=400, detail="Weights must sum to 1.0")
+        
+        metrics_result = calculate_portfolio_prediction_metrics(
+            symbols=symbols,
+            weights=weights,
+            prediction_days=payload.prediction_days
+        )
+        
+        return PortfolioPredictionMetricsResponse(
+            portfolio_metrics=metrics_result['portfolio_metrics'],
+            individual_metrics=metrics_result['individual_metrics'],
+            portfolio_interpretation=metrics_result['portfolio_interpretation'],
+            recommendation=metrics_result['recommendation']
+        )
+        
+    except Exception as e:
+        raise HTTPException(status_code=400, detail=str(e))
+
+
+@app.get("/prediction-metrics/{symbol}")
+def api_quick_prediction_metrics(symbol: str, days: int = 30):
+    """
+    Quick endpoint to get prediction metrics for a single symbol.
+    
+    Example: GET /prediction-metrics/AAPL?days=30
+    """
+    try:
+        symbol = symbol.upper().strip()
+        metrics_result = calculate_prediction_metrics(
+            symbol=symbol,
+            prediction_days=days,
+            test_split=0.2
+        )
+        
+        return {
+            "symbol": symbol,
+            "prediction_days": days,
+            "metrics": metrics_result['metrics'],
+            "interpretation": metrics_result['interpretation'],
+            "recommendation": (
+                "STRONG BUY" if metrics_result['metrics']['r_squared'] > 0.8 and 
+                                metrics_result['metrics']['sharpe_ratio'] > 1 else
+                "BUY" if metrics_result['metrics']['r_squared'] > 0.6 and 
+                         metrics_result['metrics']['sharpe_ratio'] > 0.5 else
+                "HOLD" if metrics_result['metrics']['r_squared'] > 0.4 else
+                "AVOID"
+            )
+        }
+        
+    except Exception as e:
+        raise HTTPException(status_code=400, detail=str(e))
+
+
+@app.get("/metrics-explanation")
+def api_metrics_explanation():
+    """
+    Get detailed explanations of all prediction metrics.
+    """
+    return {
+        "metrics_explained": {
+            "MAE": {
+                "name": "Mean Absolute Error",
+                "description": "Measures average magnitude of prediction errors. Lower = better.",
+                "interpretation": "Shows how far off predictions are on average. A MAE of $5 means predictions are typically $5 away from actual prices.",
+                "good_threshold": "< 10 for stocks, < 5 for excellent performance"
+            },
+            "RMSE": {
+                "name": "Root Mean Squared Error",
+                "description": "Penalizes larger errors more heavily than MAE. Lower = better fit.",
+                "interpretation": "Emphasizes larger prediction errors. If RMSE >> MAE, the model struggles with extreme price movements.",
+                "good_threshold": "< 15 for stocks, similar to MAE for consistent performance"
+            },
+            "MAPE": {
+                "name": "Mean Absolute Percentage Error",
+                "description": "Measures error as percentage of actual stock price. Useful for financial interpretability.",
+                "interpretation": "Shows prediction accuracy as a percentage. 5% MAPE means predictions are typically 5% off from actual prices.",
+                "good_threshold": "< 10% for trading, < 5% for excellent performance"
+            },
+            "R²": {
+                "name": "Coefficient of Determination",
+                "description": "Explains how much variance in stock prices is captured by the model. Higher (closer to 1) = better.",
+                "interpretation": "Shows how well the model explains price movements. 0.8 means 80% of price variance is explained by the model.",
+                "good_threshold": "> 0.6 for good models, > 0.8 for excellent models"
+            },
+            "Sharpe_Ratio": {
+                "name": "Sharpe Ratio (Financial Metric)",
+                "description": "Measures risk-adjusted return from trading strategies using the predictions. Higher = better portfolio strategy.",
+                "interpretation": "Shows if prediction-based trading is profitable after accounting for risk. > 1 is good, > 2 is excellent.",
+                "good_threshold": "> 1 for profitable trading, > 2 for excellent risk-adjusted returns"
+            },
+            "Directional_Accuracy": {
+                "name": "Directional Accuracy",
+                "description": "Percentage of time the model correctly predicts if price will go up or down.",
+                "interpretation": "Critical for trading strategies. 60% means the model correctly predicts price direction 6 out of 10 times.",
+                "good_threshold": "> 55% for useful predictions, > 65% for excellent directional accuracy"
+            }
+        },
+        "usage_guide": {
+            "for_trading": "Focus on MAPE < 10%, Sharpe Ratio > 1, and Directional Accuracy > 55%",
+            "for_analysis": "Focus on R² > 0.6 and RMSE close to MAE for consistent predictions",
+            "for_risk_management": "Monitor Sharpe Ratio and ensure RMSE doesn't significantly exceed MAE"
+        },
+        "recommended_thresholds": {
+            "excellent_model": "MAE < 5, MAPE < 5%, R² > 0.8, Sharpe > 2",
+            "good_model": "MAE < 10, MAPE < 10%, R² > 0.6, Sharpe > 1",
+            "acceptable_model": "MAE < 15, MAPE < 15%, R² > 0.4, Sharpe > 0.5",
+            "poor_model": "Any metric below acceptable thresholds"
+        }
+    }
